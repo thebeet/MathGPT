@@ -1,0 +1,16 @@
+# Model checkpoints are large binary artifacts; keep them local.
+checkpoints/
+
+# Python caches and local tooling files.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local environment and editor files.
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
