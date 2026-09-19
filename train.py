@@ -33,12 +33,22 @@ from tokenizer import CharTokenizer
 
 
 def build_tokenizer(cfg: Config) -> CharTokenizer:
+    # Preserve the original checkpoint vocabulary exactly, then append new tokens.
+    base_specials = [cfg.think_start, cfg.think_end]
+    tokens = (
+        list(cfg.chars)
+        + [cfg.pad_token, cfg.bos_token, cfg.eos_token]
+        + base_specials
+        + list("abcdefghijklmnopqrstuvwxyz/")
+        + [cfg.error_token]
+    )
     return CharTokenizer(
         chars=cfg.chars,
         pad_token=cfg.pad_token,
         bos_token=cfg.bos_token,
         eos_token=cfg.eos_token,
         extra_specials=cfg.extra_specials,
+        tokens=tokens,
     )
 
 
@@ -224,7 +234,14 @@ def exact_match_accuracy(
             reverse_in_think=reverse_in_think,
         )
         try:
-            ok = int(pred.answer) == p.result if pred.answer else False
+            if hasattr(p, "answer_text"):
+                expected = p.answer_text(False)
+            else:
+                # ExpressionProblem stores exact results as Fraction.
+                from dataset import format_fraction
+
+                expected = format_fraction(p.result)
+            ok = pred.answer == expected if pred.answer else False
         except ValueError:
             ok = False
 
@@ -313,6 +330,7 @@ def main() -> None:
         include_addition=cfg.include_addition,
         include_subtraction=cfg.include_subtraction,
         include_multiplication=cfg.include_multiplication,
+        include_division=cfg.include_division,
         mul_max_operand=cfg.mul_max_operand,
         negative_fraction=cfg.negative_fraction,
     )
@@ -333,7 +351,7 @@ def main() -> None:
         max_digits=cfg.ood_max_digits,
         ops_filter=[
             op
-            for op, on in (("+", cfg.include_addition), ("-", cfg.include_subtraction))
+            for op, on in (("+", cfg.include_addition), ("-", cfg.include_subtraction), ("/", cfg.include_division))
             if on
         ],
         **gen_kwargs,
@@ -357,6 +375,7 @@ def main() -> None:
         include_addition=cfg.include_addition,
         include_subtraction=cfg.include_subtraction,
         include_multiplication=cfg.include_multiplication,
+        include_division=cfg.include_division,
         mul_max_operand=cfg.ood_mul_max_operand,
     )
     expression_probs = generate_expression_problems(
@@ -421,7 +440,18 @@ def main() -> None:
                 key.removeprefix("_orig_mod."): value
                 for key, value in state_dict.items()
             }
-        model.load_state_dict(state_dict)
+        current = model.state_dict()
+        compatible = {
+            k: v for k, v in state_dict.items()
+            if k in current and current[k].shape == v.shape
+        }
+        model.load_state_dict(compatible, strict=False)
+        # The new vocabulary is larger; copy all old rows into the tied matrix.
+        for key in ("tok_emb.weight", "lm_head.weight"):
+            if key in state_dict and key in current:
+                rows = min(state_dict[key].shape[0], current[key].shape[0])
+                with torch.no_grad():
+                    current[key][:rows].copy_(state_dict[key][:rows])
         print(
             f"resumed from {resume_path} "
             f"(previous step={checkpoint.get('step', 'unknown')})"
@@ -527,6 +557,7 @@ def main() -> None:
                     "model": model.state_dict(),
                     "config": {k: v for k, v in cfg.__dict__.items() if k != "extra_specials"},
                     "tokenizer_chars": cfg.chars,
+                    "tokenizer_tokens": tokenizer.id_to_token,
                     "step": global_step,
                     "val_loss": val_loss,
                     "acc": acc,

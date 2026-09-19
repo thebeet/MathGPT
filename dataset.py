@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import re
+from fractions import Fraction
 from dataclasses import dataclass
 
 import torch
@@ -23,13 +24,21 @@ def fmt_num(n: int, reverse_digits: bool) -> str:
     return rev_digits(n) if reverse_digits else str(n)
 
 
+def format_fraction(value: Fraction) -> str:
+    if value.denominator == 1:
+        return str(value.numerator)
+    return f"{value.numerator}/{value.denominator}"
+
+
 def parse_prompt(prompt: str) -> tuple[int, str, int]:
     """Parse human prompt '123+45=' / '12*3=' into (a, op, b)."""
     body = prompt.strip().replace(" ", "").rstrip("=")
-    for op in ("*", "+", "-"):
-        if op in body:
-            a_s, b_s = body.split(op, 1)
-            return int(a_s), op, int(b_s)
+    match = re.fullmatch(r"(-?\d+)([+*/])(-?\d+)", body)
+    if match:
+        return int(match.group(1)), match.group(2), int(match.group(3))
+    match = re.fullmatch(r"(-?\d+)-(-?\d+)", body)
+    if match:
+        return int(match.group(1)), "-", int(match.group(2))
     raise ValueError(f"Invalid prompt: {prompt!r}")
 
 
@@ -40,7 +49,7 @@ def to_model_prompt(a: int, op: str, b: int, reverse_digits: bool) -> str:
 
 
 def _lex_expression(expr: str) -> list[str]:
-    tokens = re.findall(r"\d+|[()+*-]", expr.replace(" ", ""))
+    tokens = re.findall(r"\d+|[()+*/-]", expr.replace(" ", ""))
     if "".join(tokens) != expr.replace(" ", ""):  # reject unsupported syntax
         raise ValueError(f"Invalid expression: {expr!r}")
     return tokens
@@ -50,7 +59,7 @@ def expression_postfix(expr: str) -> list[str]:
     """Convert a binary +,-,* expression to canonical postfix tokens."""
     output: list[str] = []
     ops: list[str] = []
-    precedence = {"+": 1, "-": 1, "*": 2}
+    precedence = {"+": 1, "-": 1, "*": 2, "/": 2}
     for tok in _lex_expression(expr):
         if tok.isdigit():
             output.append(tok)
@@ -73,18 +82,20 @@ def expression_postfix(expr: str) -> list[str]:
     return output
 
 
-def evaluate_postfix(postfix: list[str]) -> tuple[int, list[tuple[int, str, int, int]]]:
+def evaluate_postfix(postfix: list[str]) -> tuple[Fraction, list[tuple[Fraction, str, Fraction, Fraction]]]:
     """Evaluate postfix and return result plus (left, op, right, result) steps."""
-    stack: list[int] = []
-    steps: list[tuple[int, str, int, int]] = []
+    stack: list[Fraction] = []
+    steps: list[tuple[Fraction, str, Fraction, Fraction]] = []
     for tok in postfix:
         if tok.isdigit():
-            stack.append(int(tok))
+            stack.append(Fraction(int(tok)))
             continue
         if len(stack) < 2:
             raise ValueError("Invalid postfix expression")
         right, left = stack.pop(), stack.pop()
-        result = {"+": left + right, "-": left - right, "*": left * right}[tok]
+        if tok == "/" and right == 0:
+            raise ZeroDivisionError("division by zero")
+        result = {"+": left + right, "-": left - right, "*": left * right, "/": left / right}[tok]
         steps.append((left, tok, right, result))
         stack.append(result)
     if len(stack) != 1:
@@ -98,7 +109,7 @@ def _reverse_stage(numbers: list[str]) -> str:
 
 def _postfix_stage(postfix: list[str]) -> str:
     return ";".join(
-        rev_digits(int(tok)) if tok.lstrip("-").isdigit() else tok
+        format_fraction(Fraction(tok)) if re.fullmatch(r"-?\d+(?:/\d+)?", tok) else tok
         for tok in postfix
     )
 
@@ -173,6 +184,13 @@ def decode_model_answer(text: str, reverse_digits: bool) -> str:
     """
     if not text:
         return ""
+    if text.startswith("<err>"):
+        return "<err>"
+    if not reverse_digits and re.fullmatch(r"-?\d+/\d+", text.strip()):
+        try:
+            return format_fraction(Fraction(text.strip()))
+        except ValueError:
+            return ""
 
     if reverse_digits:
         i = 0
@@ -290,10 +308,15 @@ def sub_scratchpad(a: int, b: int, reverse_digits: bool) -> str:
 def make_scratchpad(a: int, op: str, b: int, reverse_digits: bool) -> str:
     if op not in {"+", "-", "*"}:
         raise ValueError(f"Unknown op: {op!r}")
-    result = {"+": a + b, "-": a - b, "*": a * b}[op]
+    if op == "/":
+        if b == 0:
+            return f"{fmt_num(a, reverse_digits)}{op}{fmt_num(b, reverse_digits)}=<err>"
+        result = Fraction(a, b)
+    else:
+        result = {"+": a + b, "-": a - b, "*": a * b}[op]
     return (
         f"{fmt_num(a, reverse_digits)}{op}{fmt_num(b, reverse_digits)}="
-        f"{fmt_num(result, reverse_digits)}"
+        f"{format_fraction(result) if isinstance(result, Fraction) else fmt_num(result, reverse_digits)}"
     )
 
 
@@ -309,7 +332,7 @@ class Problem:
     a: int
     op: str
     b: int
-    result: int
+    result: Fraction | int | str
 
     @property
     def human_prompt(self) -> str:
@@ -319,6 +342,10 @@ class Problem:
         return to_model_prompt(self.a, self.op, self.b, reverse_digits)
 
     def answer_text(self, reverse_digits: bool) -> str:
+        if self.result == "<err>":
+            return "<err>"
+        if isinstance(self.result, Fraction):
+            return format_fraction(self.result)
         return fmt_num(self.result, reverse_digits)
 
     def scratchpad(self, reverse_digits: bool) -> str:
@@ -345,8 +372,8 @@ class Problem:
             prompt = self.human_prompt
             return (
                 f"{prompt}{think_start}"
-                f"{self.a}{self.op}{self.b}={self.result}"
-                f"{think_end}{self.result}"
+                f"{self.a}{self.op}{self.b}={self.answer_text(False)}"
+                f"{think_end}{self.answer_text(False)}"
             )
 
         prompt = self.model_prompt(reverse_digits)
@@ -406,7 +433,7 @@ def generate_expression_problems(
     rng = random.Random(seed)
     out: list[ExpressionProblem] = []
     seen: set[str] = set()
-    ops = ("+", "-", "*")
+    ops = ("+", "-", "*", "/")
     min_terms = max(2, min_terms)
     max_terms = max(min_terms, max_terms)
     while len(out) < n:
@@ -435,7 +462,7 @@ def generate_expression_problems(
             continue
         try:
             result, _ = evaluate_postfix(expression_postfix(expr))
-        except ValueError:
+        except (ValueError, ZeroDivisionError):
             continue
         seen.add(expr)
         out.append(ExpressionProblem(expr, result))
@@ -495,6 +522,7 @@ def enabled_ops(
     include_addition: bool = True,
     include_subtraction: bool = True,
     include_multiplication: bool = True,
+    include_division: bool = False,
 ) -> list[str]:
     ops: list[str] = []
     if include_addition:
@@ -503,6 +531,8 @@ def enabled_ops(
         ops.append("-")
     if include_multiplication:
         ops.append("*")
+    if include_division:
+        ops.append("/")
     if not ops:
         raise ValueError("At least one operation must be enabled")
     return ops
@@ -514,14 +544,18 @@ def make_problem(
     include_addition: bool = True,
     include_subtraction: bool = True,
     include_multiplication: bool = True,
+    include_division: bool = False,
     mul_max_operand: int = 99_999,
 ) -> Problem:
     op = rng.choice(
-        enabled_ops(include_addition, include_subtraction, include_multiplication)
+        enabled_ops(include_addition, include_subtraction, include_multiplication, include_division)
     )
     if op == "*":
         a, b = sample_operand_pair(rng, mul_max_operand)
         return Problem(a, "*", b, a * b)
+    if op == "/":
+        a, b = sample_operand_pair(rng, max_number)
+        return Problem(a, "/", b, "<err>" if b == 0 else Fraction(a, b))
     a, b = sample_operand_pair(rng, max_number)
     if op == "-":
         return Problem(a, "-", b, a - b)
@@ -539,6 +573,7 @@ def generate_problems(
     b_max_digits: int | None = None,
     include_addition: bool = True,
     include_multiplication: bool = True,
+    include_division: bool = False,
     mul_max_operand: int = 99_999,
     negative_fraction: float = 0.25,
     ops_filter: list[str] | None = None,
@@ -553,7 +588,7 @@ def generate_problems(
     seen = exclude if exclude is not None else set()
     attempts = 0
     max_attempts = max(n * 80, 10_000)
-    default_ops = enabled_ops(include_addition, include_subtraction, include_multiplication)
+    default_ops = enabled_ops(include_addition, include_subtraction, include_multiplication, include_division)
 
     while len(out) < n and attempts < max_attempts:
         attempts += 1
@@ -573,6 +608,9 @@ def generate_problems(
                 negative_fraction=negative_fraction,
             )
             p = Problem(a, "*", b, a * b)
+        elif op == "/":
+            a, b = sample_operand_pair(rng, max_number, min_digits, max_digits, b_min_digits, b_max_digits, negative_fraction=negative_fraction)
+            p = Problem(a, "/", b, "<err>" if b == 0 else Fraction(a, b))
         else:
             a, b = sample_operand_pair(
                 rng,

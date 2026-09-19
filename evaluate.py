@@ -31,7 +31,10 @@ def load_model(ckpt_path: str, device: torch.device) -> tuple[MathGPT, CharToken
         raw["legacy_format"] = True
         raw["reverse_in_think"] = False
     cfg = Config(**{k: v for k, v in raw.items() if k in Config.__dataclass_fields__})
-    tokenizer = build_tokenizer(cfg)
+    tokenizer = CharTokenizer(
+        tokens=ckpt.get("tokenizer_tokens"),
+        extra_specials=cfg.extra_specials,
+    ) if ckpt.get("tokenizer_tokens") else build_tokenizer(cfg)
     model = MathGPT(
         vocab_size=tokenizer.vocab_size,
         d_model=cfg.d_model,
@@ -50,7 +53,14 @@ def load_model(ckpt_path: str, device: torch.device) -> tuple[MathGPT, CharToken
             key.removeprefix("_orig_mod."): value
             for key, value in state_dict.items()
         }
-    model.load_state_dict(state_dict)
+    current = model.state_dict()
+    compatible = {k: v for k, v in state_dict.items() if k in current and current[k].shape == v.shape}
+    model.load_state_dict(compatible, strict=False)
+    for key in ("tok_emb.weight", "lm_head.weight"):
+        if key in state_dict and key in current:
+            rows = min(state_dict[key].shape[0], current[key].shape[0])
+            with torch.no_grad():
+                current[key][:rows].copy_(state_dict[key][:rows])
     model.eval()
     return model, tokenizer, cfg
 

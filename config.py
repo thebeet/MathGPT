@@ -6,6 +6,7 @@ class Config:
     # Vocabulary: digits + operators + scratchpad punctuation + special tokens
     # NOTE: changing chars / think tags invalidates old checkpoints (embedding size changes)
     # Semicolons separate compact reasoning steps.
+    # New characters are appended after the original vocabulary when migrating.
     chars: str = "0123456789+-*=;()"
     pad_token: str = "<pad>"
     bos_token: str = "<bos>"
@@ -18,6 +19,7 @@ class Config:
     postfix_end: str = "</postfix>"
     eval_start: str = "<eval>"
     eval_end: str = "</eval>"
+    error_token: str = "<err>"
 
     # Model (~303M params with weight tying)
     # 1024 x 24 layers x 4096 FFN, with 16 attention heads.
@@ -39,6 +41,7 @@ class Config:
     include_addition: bool = True
     include_subtraction: bool = True
     include_multiplication: bool = True
+    include_division: bool = True
     # Write numbers least-significant-digit first (helps + / -; still used for *)
     reverse_digits: bool = True
     # Keep the user expression normal-order; teach reversal inside <think>.
@@ -56,6 +59,7 @@ class Config:
     expression_start_max_terms: int = 5
     expression_growth_every: int = 1
     expression_parentheses_fraction: float = 0.8
+    division_fraction: float = 0.15
     # Continued training: mix familiar examples with longer 6-7 digit problems.
     train_easy_max_number: int = 999_999
     train_hard_min_digits: int = 6
@@ -104,4 +108,4 @@ class Config:
 
     @property
     def extra_specials(self) -> list[str]:
-        return [self.think_start, self.think_end]
+        return [self.think_start, self.think_end, self.error_token]
