@@ -6,35 +6,27 @@ import os
 import torch
 
 from config import Config
-from dataset import generate_problems
+from dataset import (
+    generate_expression_problems,
+    generate_linear_equation_problems,
+    generate_problems,
+)
 from model import MathGPT
-from tokenizer import CharTokenizer
 from train import (
-    build_tokenizer,
     exact_match_accuracy,
     format_prediction,
     get_device,
+    load_model_from_checkpoint,
+    load_tokenizer_from_checkpoint,
     predict_result,
 )
 
 
-def load_model(ckpt_path: str, device: torch.device) -> tuple[MathGPT, CharTokenizer, Config]:
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+def load_model(ckpt_path: str, device: torch.device) -> tuple[MathGPT, object, Config]:
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     raw = ckpt["config"]
-    legacy_format = "reverse_in_think" not in raw
-    # Backward-compatible: old ckpts used reverse_answer
-    if "reverse_digits" not in raw and "reverse_answer" in raw:
-        raw = dict(raw)
-        raw["reverse_digits"] = raw.pop("reverse_answer")
-    if legacy_format:
-        raw = dict(raw)
-        raw["legacy_format"] = True
-        raw["reverse_in_think"] = False
     cfg = Config(**{k: v for k, v in raw.items() if k in Config.__dataclass_fields__})
-    tokenizer = CharTokenizer(
-        tokens=ckpt.get("tokenizer_tokens"),
-        extra_specials=cfg.extra_specials,
-    ) if ckpt.get("tokenizer_tokens") else build_tokenizer(cfg)
+    tokenizer = load_tokenizer_from_checkpoint(cfg, ckpt)
     model = MathGPT(
         vocab_size=tokenizer.vocab_size,
         d_model=cfg.d_model,
@@ -44,23 +36,7 @@ def load_model(ckpt_path: str, device: torch.device) -> tuple[MathGPT, CharToken
         dropout=0.0,
         max_seq_len=cfg.max_seq_len,
     ).to(device)
-    state_dict = ckpt["model"]
-    # torch.compile wraps the module and prefixes saved parameter names with
-    # `_orig_mod.`. Inference constructs the normal (uncompiled) module.
-    # Normalize compiled checkpoints so both save formats load transparently.
-    if any(key.startswith("_orig_mod.") for key in state_dict):
-        state_dict = {
-            key.removeprefix("_orig_mod."): value
-            for key, value in state_dict.items()
-        }
-    current = model.state_dict()
-    compatible = {k: v for k, v in state_dict.items() if k in current and current[k].shape == v.shape}
-    model.load_state_dict(compatible, strict=False)
-    for key in ("tok_emb.weight", "lm_head.weight"):
-        if key in state_dict and key in current:
-            rows = min(state_dict[key].shape[0], current[key].shape[0])
-            with torch.no_grad():
-                current[key][:rows].copy_(state_dict[key][:rows])
+    load_model_from_checkpoint(model, ckpt)
     model.eval()
     return model, tokenizer, cfg
 
@@ -75,6 +51,9 @@ def main() -> None:
     parser.add_argument("--hard-size", type=int, default=200)
     parser.add_argument("--mul-size", type=int, default=100)
     parser.add_argument("--ood-mul-size", type=int, default=100)
+    parser.add_argument("--div-size", type=int, default=100)
+    parser.add_argument("--expr-size", type=int, default=100)
+    parser.add_argument("--eq-size", type=int, default=100)
     args = parser.parse_args()
 
     cfg_default = Config()
@@ -88,7 +67,16 @@ def main() -> None:
         include_addition=cfg.include_addition,
         include_subtraction=cfg.include_subtraction,
         include_multiplication=cfg.include_multiplication,
+        include_division=cfg.include_division,
         mul_max_operand=cfg.mul_max_operand,
+    )
+    eval_kw = dict(
+        reverse_digits=cfg.reverse_digits,
+        limit=None,
+        max_new_tokens=cfg.max_new_tokens,
+        think_start=cfg.think_start,
+        think_end=cfg.think_end,
+        reverse_in_think=cfg.reverse_in_think,
     )
     val = generate_problems(args.val_size, cfg.max_number, seed=999, **gen_kw)
     hard = generate_problems(
@@ -99,7 +87,11 @@ def main() -> None:
         max_digits=cfg.ood_max_digits,
         ops_filter=[
             op
-            for op, on in (("+", cfg.include_addition), ("-", cfg.include_subtraction))
+            for op, on in (
+                ("+", cfg.include_addition),
+                ("-", cfg.include_subtraction),
+                ("/", cfg.include_division),
+            )
             if on
         ],
         **gen_kw,
@@ -123,59 +115,53 @@ def main() -> None:
         include_addition=cfg.include_addition,
         include_subtraction=cfg.include_subtraction,
         include_multiplication=cfg.include_multiplication,
+        include_division=cfg.include_division,
         mul_max_operand=cfg.ood_mul_max_operand,
     )
-    acc, by_d = exact_match_accuracy(
-        model,
-        val,
-        tokenizer,
-        device,
-        reverse_digits=cfg.reverse_digits,
-        limit=None,
-        max_new_tokens=cfg.max_new_tokens,
-        think_start=cfg.think_start,
-        think_end=cfg.think_end,
+    div = generate_problems(
+        args.div_size,
+        cfg.max_number,
+        seed=1004,
+        ops_filter=["/"],
+        **gen_kw,
     )
-    hard_acc, _ = exact_match_accuracy(
-        model,
-        hard,
-        tokenizer,
-        device,
-        reverse_digits=cfg.reverse_digits,
-        limit=None,
-        max_new_tokens=cfg.max_new_tokens,
-        think_start=cfg.think_start,
-        think_end=cfg.think_end,
+    expressions = generate_expression_problems(
+        args.expr_size,
+        cfg.max_number,
+        seed=1005,
+        min_terms=cfg.expression_eval_min_terms,
+        max_terms=cfg.expression_eval_max_terms,
+        parentheses_fraction=cfg.expression_parentheses_fraction,
+        min_digits=cfg.expression_eval_min_digits,
+        max_digits=cfg.expression_eval_max_digits,
     )
-    mul_acc, _ = exact_match_accuracy(
-        model,
-        mul,
-        tokenizer,
-        device,
-        reverse_digits=cfg.reverse_digits,
-        limit=None,
-        max_new_tokens=cfg.max_new_tokens,
-        think_start=cfg.think_start,
-        think_end=cfg.think_end,
+    equations = generate_linear_equation_problems(
+        args.eq_size,
+        seed=1006,
+        max_abs=99,
+        max_coef=12,
+        err_fraction=0.15,
     )
-    ood_mul_acc, _ = exact_match_accuracy(
-        model,
-        ood_mul,
-        tokenizer,
-        device,
-        reverse_digits=cfg.reverse_digits,
-        limit=None,
-        max_new_tokens=cfg.max_new_tokens,
-        think_start=cfg.think_start,
-        think_end=cfg.think_end,
-    )
-    print(f"acc (in-dist mixed): {acc:.3f}")
-    print(f"ood +/- {cfg.ood_min_digits}-{cfg.ood_max_digits}d: {hard_acc:.3f}")
+    acc, by_d = exact_match_accuracy(model, val, tokenizer, device, **eval_kw)
+    hard_acc, _ = exact_match_accuracy(model, hard, tokenizer, device, **eval_kw)
+    mul_acc, _ = exact_match_accuracy(model, mul, tokenizer, device, **eval_kw)
+    ood_mul_acc, _ = exact_match_accuracy(model, ood_mul, tokenizer, device, **eval_kw)
+    div_acc, _ = exact_match_accuracy(model, div, tokenizer, device, **eval_kw)
+    expr_acc, _ = exact_match_accuracy(model, expressions, tokenizer, device, **eval_kw)
+    eq_acc, _ = exact_match_accuracy(model, equations, tokenizer, device, **eval_kw)
+    print(f"acc (in-dist mixed +/-*): {acc:.3f}")
+    print(f"ood {cfg.ood_min_digits}-{cfg.ood_max_digits}d (+/-/): {hard_acc:.3f}")
     print(f"mul in-dist (<= {cfg.mul_max_operand}): {mul_acc:.3f}")
     print(
         f"ood mul {cfg.ood_mul_min_digits}d x <={cfg.ood_mul_b_max_digits}d: {ood_mul_acc:.3f}"
     )
-    print("by digits:", " ".join(f"{k}={v:.3f}" for k, v in by_d.items()))
+    print(f"div in-dist (<= {cfg.max_number}): {div_acc:.3f}")
+    print(
+        f"expressions ({cfg.expression_eval_min_terms}-{cfg.expression_eval_max_terms} terms): "
+        f"{expr_acc:.3f}"
+    )
+    print(f"equations (linear, x= integer): {eq_acc:.3f}")
+    print("by digits (mixed val):", " ".join(f"{k}={v:.3f}" for k, v in by_d.items()))
 
     demos = [
         "3+5=",
@@ -194,6 +180,11 @@ def main() -> None:
         "1000000-1=",
         "654321+123456=",
         "1000000-999999=",
+        "8/2=",
+        "7/3=",
+        "2*3+4*5=",
+        "3*x+5=14",
+        "0*x+3=5",
     ]
     print("\ndemos:")
     for p in demos:

@@ -3,11 +3,13 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # Vocabulary: digits + operators + scratchpad punctuation + special tokens
-    # NOTE: changing chars / think tags invalidates old checkpoints (embedding size changes)
-    # Semicolons separate compact reasoning steps.
-    # New characters are appended after the original vocabulary when migrating.
-    chars: str = "0123456789+-*=;()"
+    # Single-character vocabulary (multi-char tokens come from pad/bos/eos and extra_specials).
+    # Semicolons separate reasoning steps; c marks carry in digit-wise scratchpad traces.
+    chars: str = (
+        "0123456789+-*/=;()"
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    )
     pad_token: str = "<pad>"
     bos_token: str = "<bos>"
     eos_token: str = "<eos>"
@@ -20,6 +22,9 @@ class Config:
     eval_start: str = "<eval>"
     eval_end: str = "</eval>"
     error_token: str = "<err>"
+    # Total vocabulary size (chars + pad/bos/eos + extra_specials including <unuseN> pads).
+    vocab_size: int = 120
+    reserved_token_prefix: str = "<unuse"
 
     # Model (~303M params with weight tying)
     # 1024 x 24 layers x 4096 FFN, with 16 attention heads.
@@ -45,8 +50,6 @@ class Config:
     reverse_digits: bool = True
     # Keep the user expression normal-order; teach reversal inside <think>.
     reverse_in_think: bool = True
-    # Set automatically when loading checkpoints produced before structured think.
-    legacy_format: bool = False
     # Supervised scratchpad between <think> tags, then the final answer
     use_scratchpad: bool = True
     # Digit-wise traces for all ops — the algorithm, not the max width, is what extrapolates
@@ -95,11 +98,15 @@ class Config:
     # Keep the effective batch at 256 through gradient accumulation.
     batch_size: int = 16
     grad_accum_steps: int = 16
-    lr: float = 6e-5
-    weight_decay: float = 0.1
+    lr: float = 5e-5
+    weight_decay: float = 0.05
     # Fine-tune the existing checkpoint on the updated fraction scratchpad.
     epochs: int = 2
+    # Full warmup only for grade 1 at global step 0; each later grade uses grade_warmup_steps.
     warmup_steps: int = 1000
+    grade_warmup_steps: int = 400
+    # Cosine floor within a grade segment: min_lr = lr * lr_min_ratio.
+    lr_min_ratio: float = 0.3
     grad_clip: float = 1.0
     log_every: int = 100
     eval_every: int = 2000
@@ -112,7 +119,26 @@ class Config:
     checkpoint_dir: str = "checkpoints"
     checkpoint_name: str = "mathgpt.pt"
     resume_checkpoint: str = "checkpoints/mathgpt.pt"
+    # After passing a grade exam, also write checkpoints/mathgpt_grade{N}.pt
+    save_grade_checkpoints: bool = True
+    grade_checkpoint_name_template: str = "mathgpt_grade{grade_id}.pt"
+    equation_fraction: float = 0.0
+    curriculum_exam_seed_base: int = 900_001
+    save_optimizer_state: bool = True
+
+    @property
+    def active_specials(self) -> list[str]:
+        """Multi-char tokens used in training data."""
+        return [self.think_start, self.think_end, self.error_token]
+
+    @property
+    def reserved_specials(self) -> list[str]:
+        """Placeholder slots <unuse1>.. for future vocabulary extensions."""
+        used = len(self.chars) + 3 + len(self.active_specials)
+        n = max(0, self.vocab_size - used)
+        p = self.reserved_token_prefix
+        return [f"{p}{i}>" for i in range(1, n + 1)]
 
     @property
     def extra_specials(self) -> list[str]:
-        return [self.think_start, self.think_end, self.error_token]
+        return self.active_specials + self.reserved_specials

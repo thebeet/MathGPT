@@ -8,16 +8,12 @@ import torch
 
 from config import Config
 from evaluate import load_model
+from dataset import normalize_human_prompt
 from train import format_prediction, get_device, predict_result
 
 
 def normalize_prompt(text: str) -> str:
-    p = text.strip().replace(" ", "")
-    if not p:
-        raise ValueError("empty prompt")
-    if not p.endswith("="):
-        p += "="
-    return p
+    return normalize_human_prompt(text)
 
 
 def main() -> None:

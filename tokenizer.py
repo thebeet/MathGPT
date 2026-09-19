@@ -6,13 +6,16 @@ class CharTokenizer:
 
     def __init__(
         self,
-        chars: str = "0123456789+-*=;c",
+        chars: str = (
+            "0123456789+-*/=;()"
+            "abcdefghijklmnopqrstuvwxyz"
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        ),
         pad_token: str = "<pad>",
         bos_token: str = "<bos>",
         eos_token: str = "<eos>",
         extra_specials: list[str] | None = None,
         tokens: list[str] | None = None,
-        appended_tokens: list[str] | None = None,
     ) -> None:
         specials = [pad_token, bos_token, eos_token] + list(extra_specials or [])
         self.pad_token = pad_token
@@ -20,8 +23,7 @@ class CharTokenizer:
         self.eos_token = eos_token
         self.extra_specials = list(extra_specials or [])
 
-        # Token IDs must remain stable when loading older checkpoints.
-        self.id_to_token = list(tokens) if tokens is not None else list(chars) + specials + list(appended_tokens or [])
+        self.id_to_token = list(tokens) if tokens is not None else list(chars) + specials
         self.token_to_id = {tok: i for i, tok in enumerate(self.id_to_token)}
         self.vocab_size = len(self.id_to_token)
 

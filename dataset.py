@@ -210,6 +210,136 @@ def _postfix_reduction_stages(
     return stages
 
 
+_NUM = r"\d+(?:/\d+)?"
+
+
+def _parse_operand(text: str) -> Fraction:
+    return Fraction(text)
+
+
+def _is_num_token(tok: str) -> bool:
+    return re.fullmatch(_NUM, tok) is not None
+
+
+def _tokens_to_expr(tokens: list[str]) -> str:
+    return "".join(tokens)
+
+
+def _apply_binop(left: Fraction, op: str, right: Fraction) -> Fraction:
+    if op == "/" and right == 0:
+        raise ZeroDivisionError("division by zero")
+    return {"+": left + right, "-": left - right, "*": left * right, "/": left / right}[op]
+
+
+def _find_redex_index(tokens: list[str], operators: set[str]) -> int | None:
+    """Index of leftmost binary operator at paren depth 0 matching operators."""
+    depth = 0
+    for i, tok in enumerate(tokens):
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+        elif depth == 0 and tok in operators:
+            if i > 0 and i + 1 < len(tokens):
+                if _is_num_token(tokens[i - 1]) and _is_num_token(tokens[i + 1]):
+                    return i
+    return None
+
+
+def _apply_reduction_at(tokens: list[str], op_index: int) -> list[str]:
+    left = _parse_operand(tokens[op_index - 1])
+    op = tokens[op_index]
+    right = _parse_operand(tokens[op_index + 1])
+    val = format_fraction(_apply_binop(left, op, right))
+    return tokens[: op_index - 1] + [val] + tokens[op_index + 2 :]
+
+
+def _batch_reduce_tokens(tokens: list[str], operators: set[str]) -> list[str]:
+    """Apply every * or / (or + or -) at depth 0 before moving to the next precedence."""
+    out = tokens
+    while True:
+        op_index = _find_redex_index(out, operators)
+        if op_index is None:
+            return out
+        out = _apply_reduction_at(out, op_index)
+
+
+def _innermost_paren_span(tokens: list[str]) -> tuple[int, int] | None:
+    """Inclusive token indices for the leftmost innermost (...), or None."""
+    for i, tok in enumerate(tokens):
+        if tok != "(":
+            continue
+        depth = 1
+        j = i + 1
+        while j < len(tokens) and depth:
+            if tokens[j] == "(":
+                depth += 1
+            elif tokens[j] == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            raise ValueError("Unbalanced parentheses")
+        inner = tokens[i + 1 : j - 1]
+        if "(" not in inner:
+            return i, j - 1
+    return None
+
+
+def _reduce_token_slice(tokens: list[str]) -> list[str] | None:
+    """One scratchpad step on a flat token slice: all */ then none left, else all +-."""
+    if _find_redex_index(tokens, {"*", "/"}) is not None:
+        return _batch_reduce_tokens(tokens, {"*", "/"})
+    if _find_redex_index(tokens, {"+", "-"}) is not None:
+        return _batch_reduce_tokens(tokens, {"+", "-"})
+    return None
+
+
+def _one_infix_reduction(expr: str) -> str | None:
+    """One chain step: innermost parens first; each step clears all */ or all +-."""
+    tokens = _lex_expression(expr)
+    span = _innermost_paren_span(tokens)
+    if span is not None:
+        start, end = span
+        inner = tokens[start + 1 : end]
+        if len(inner) == 1 and _is_num_token(inner[0]):
+            new_inner = inner
+        else:
+            reduced = _reduce_token_slice(inner)
+            if reduced is None:
+                return None
+            new_inner = reduced
+        if len(new_inner) == 1 and _is_num_token(new_inner[0]):
+            replacement = new_inner
+        else:
+            replacement = ["("] + new_inner + [")"]
+        tokens = tokens[:start] + replacement + tokens[end + 1 :]
+        return _tokens_to_expr(tokens)
+
+    reduced = _reduce_token_slice(tokens)
+    if reduced is None:
+        return None
+    return _tokens_to_expr(reduced)
+
+
+def expression_infix_reduction_chain(expr: str) -> tuple[Fraction, list[str]]:
+    """Build infix scratchpad stages: expr=after_step1=after_step2=...=final."""
+    stages = [expr]
+    current = expr
+    while True:
+        if re.fullmatch(_NUM, current):
+            break
+        nxt = _one_infix_reduction(current)
+        if nxt is None or nxt == current:
+            raise ValueError(f"Could not reduce expression: {expr!r}")
+        current = nxt
+        stages.append(current)
+    result = _parse_operand(current)
+    answer = format_fraction(result)
+    if stages[-1] != answer:
+        stages.append(answer)
+    return result, stages
+
+
 def expression_train_text(
     expr: str,
     reverse_start: str = "<reverse>",
@@ -221,13 +351,10 @@ def expression_train_text(
     think_start: str = "<think>",
     think_end: str = "</think>",
 ) -> str:
-    postfix = expression_postfix(expr)
-    result, steps = evaluate_postfix_raw(postfix)
-    return (
-        f"{expr}={think_start}"
-        + ";".join(steps)
-        + f"{think_end}{result}"
-    )
+    result, stages = expression_infix_reduction_chain(expr)
+    answer = format_fraction(result)
+    think_body = "=".join(stages)
+    return f"{expr}={think_start}{think_body}{think_end}{answer}"
 
 
 def reverse_digit_runs(text: str) -> str:
@@ -254,6 +381,10 @@ def decode_model_answer(text: str, reverse_digits: bool) -> str:
     """
     if not text:
         return ""
+    stripped = text.strip()
+    match = re.match(r"x=-?\d+", stripped)
+    if match:
+        return match.group(0)
     if text.startswith("<err>"):
         return "<err>"
     if not reverse_digits and re.fullmatch(r"-?\d+/\d+", text.strip()):
@@ -491,6 +622,161 @@ class ExpressionProblem:
         )
 
 
+def format_ax_plus_k_lhs(a: int, k: int) -> str:
+    """Left-hand side a*x+k (k may be negative, shown as a*x-n)."""
+    if k == 0:
+        return f"{a}*x"
+    if k > 0:
+        return f"{a}*x+{k}"
+    return f"{a}*x-{abs(k)}"
+
+
+def parse_ax_plus_k_lhs(lhs: str) -> tuple[int, int]:
+    """Parse lhs as a*x+k; returns (a, k) with signed k."""
+    m = re.fullmatch(r"(\d+)\*x\+(\d+)", lhs)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.fullmatch(r"(\d+)\*x\-(\d+)", lhs)
+    if m:
+        return int(m.group(1)), -int(m.group(2))
+    m = re.fullmatch(r"(\d+)\*x", lhs)
+    if m:
+        return int(m.group(1)), 0
+    raise ValueError(f"Unsupported lhs: {lhs!r}")
+
+
+def format_linear_equation(a: int, k: int, c: int) -> str:
+    return f"{format_ax_plus_k_lhs(a, k)}={c}"
+
+
+def is_linear_equation_prompt(text: str) -> bool:
+    """True for prompts like a*x+k=c (equation already contains '=')."""
+    p = text.strip().replace(" ", "")
+    return "x" in p and "=" in p
+
+
+def normalize_human_prompt(text: str) -> str:
+    """Arithmetic/expressions: trailing '='; linear equations: no trailing '='."""
+    p = text.strip().replace(" ", "")
+    if not p:
+        raise ValueError("empty prompt")
+    if is_linear_equation_prompt(p):
+        return p[:-1] if p.endswith("=") else p
+    if not p.endswith("="):
+        p += "="
+    return p
+
+
+def _equation_move_rhs(a: int, k: int, c: int) -> str:
+    """Show a*x on lhs and c ± k on rhs after moving constant k."""
+    if k == 0:
+        return f"{a}*x={c}"
+    if k > 0:
+        return f"{a}*x={c}-{k}"
+    return f"{a}*x={c}+{abs(k)}"
+
+
+def equation_solve_chain(equation: str, x_value: int | None) -> str:
+    """Semicolon-separated steps for a*x+k=c; x_value None or a=0 => <err>."""
+    if x_value is None:
+        return "<err>"
+    lhs, rhs_s = equation.split("=", 1)
+    c = int(rhs_s)
+    a, k = parse_ax_plus_k_lhs(lhs)
+    if a == 0:
+        return "<err>"
+    inner = c - k
+    stages = [_equation_move_rhs(a, k, c), f"{a}*x={inner}", f"x={inner}/{a}", f"x={x_value}"]
+    return ";".join(stages)
+
+
+@dataclass(frozen=True)
+class LinearEquationProblem:
+    """Linear equation a*x+k=c; answer x=<int> or <err> when a=0."""
+
+    equation: str
+    x_value: int | None
+
+    @property
+    def human_prompt(self) -> str:
+        return self.equation
+
+    def answer_text(self, reverse_digits: bool = False) -> str:
+        if self.x_value is None:
+            return "<err>"
+        return f"x={self.x_value}"
+
+    def train_text(
+        self,
+        reverse_digits: bool = True,
+        use_scratchpad: bool = True,
+        scratchpad_ops: tuple[str, ...] = ("+", "-", "*"),
+        think_start: str = "<think>",
+        think_end: str = "</think>",
+        reverse_in_think: bool = True,
+        reverse_start: str = "<reverse>",
+        reverse_end: str = "</reverse>",
+        postfix_start: str = "<postfix>",
+        postfix_end: str = "</postfix>",
+        eval_start: str = "<eval>",
+        eval_end: str = "</eval>",
+    ) -> str:
+        think_body = equation_solve_chain(self.equation, self.x_value)
+        answer = self.answer_text(False)
+        return f"{self.equation}{think_start}{think_body}{think_end}{answer}"
+
+
+def generate_linear_equation_problems(
+    n: int,
+    seed: int = 0,
+    max_abs: int = 20,
+    max_coef: int = 9,
+    err_fraction: float = 0.12,
+) -> list[LinearEquationProblem]:
+    """Generate n equations a*x+k=c (duplicates allowed); a=0 cases answer <err>."""
+    rng = random.Random(seed)
+    out: list[LinearEquationProblem] = []
+    max_coef = max(1, max_coef)
+    err_fraction = min(1.0, max(0.0, err_fraction))
+    err_target = int(round(n * err_fraction))
+    err_count = 0
+
+    def sample_one() -> LinearEquationProblem | None:
+        nonlocal err_count
+        want_err = err_count < err_target and rng.random() < err_fraction + 0.05
+        if want_err:
+            a = 0
+            k = rng.randint(-max_abs, max_abs)
+            c = rng.randint(-max_abs, max_abs)
+            eq = format_linear_equation(a, k, c)
+            err_count += 1
+            return LinearEquationProblem(eq, None)
+
+        a = rng.randint(1, max_coef)
+        x = rng.randint(-max_abs, max_abs)
+        k = rng.randint(-max_abs, max_abs)
+        c = a * x + k
+        if abs(c) > max(max_abs, max_coef * max_abs):
+            return None
+        eq = format_linear_equation(a, k, c)
+        try:
+            parse_ax_plus_k_lhs(eq.split("=", 1)[0])
+            equation_solve_chain(eq, x)
+        except ValueError:
+            return None
+        return LinearEquationProblem(eq, x)
+
+    attempts = 0
+    max_attempts = max(n * 50, 1_000)
+    while len(out) < n and attempts < max_attempts:
+        attempts += 1
+        p = sample_one()
+        if p is not None:
+            out.append(p)
+
+    return out
+
+
 def generate_expression_problems(
     n: int,
     max_number: int,
@@ -504,7 +790,6 @@ def generate_expression_problems(
     """Generate valid mixed expressions for supervised postfix learning."""
     rng = random.Random(seed)
     out: list[ExpressionProblem] = []
-    seen: set[str] = set()
     ops = ("+", "-", "*", "/")
     min_terms = max(2, min_terms)
     max_terms = max(min_terms, max_terms)
@@ -533,13 +818,10 @@ def generate_expression_problems(
                 if i < terms - 1:
                     tokens.append(operators[i])
             expr = "".join(tokens)
-        if expr in seen:
-            continue
         try:
             result, _ = evaluate_postfix(expression_postfix(expr))
         except (ValueError, ZeroDivisionError):
             continue
-        seen.add(expr)
         out.append(ExpressionProblem(expr, result))
     return out
 
@@ -652,25 +934,14 @@ def generate_problems(
     mul_max_operand: int = 99_999,
     negative_fraction: float = 0.25,
     ops_filter: list[str] | None = None,
-    exclude: set[tuple[int, str, int]] | None = None,
 ) -> list[Problem]:
-    """
-    Generate unique problems. If exclude is provided, skip those keys and add new ones
-    into the same set (so callers can keep uniqueness across multiple calls).
-    """
+    """Sample `n` binary problems i.i.d. (duplicates allowed)."""
     rng = random.Random(seed)
     out: list[Problem] = []
-    seen = exclude if exclude is not None else set()
-    attempts = 0
-    max_attempts = max(n * 80, 10_000)
     default_ops = enabled_ops(include_addition, include_subtraction, include_multiplication, include_division)
 
-    while len(out) < n and attempts < max_attempts:
-        attempts += 1
-        if ops_filter is not None:
-            op = rng.choice(ops_filter)
-        else:
-            op = rng.choice(default_ops)
+    for _ in range(n):
+        op = rng.choice(ops_filter) if ops_filter is not None else rng.choice(default_ops)
 
         if op == "*":
             a, b = sample_operand_pair(
@@ -684,7 +955,15 @@ def generate_problems(
             )
             p = Problem(a, "*", b, a * b)
         elif op == "/":
-            a, b = sample_operand_pair(rng, max_number, min_digits, max_digits, b_min_digits, b_max_digits, negative_fraction=negative_fraction)
+            a, b = sample_operand_pair(
+                rng,
+                max_number,
+                min_digits,
+                max_digits,
+                b_min_digits,
+                b_max_digits,
+                negative_fraction=negative_fraction,
+            )
             p = Problem(a, "/", b, "<err>" if b == 0 else Fraction(a, b))
         else:
             a, b = sample_operand_pair(
@@ -700,11 +979,6 @@ def generate_problems(
                 p = Problem(a, "-", b, a - b)
             else:
                 p = Problem(a, "+", b, a + b)
-
-        key = (p.a, p.op, p.b)
-        if key in seen:
-            continue
-        seen.add(key)
         out.append(p)
     return out
 
@@ -714,7 +988,7 @@ class EquationDataset(Dataset):
 
     def __init__(
         self,
-        problems: list[Problem | ExpressionProblem],
+        problems: list[Problem | ExpressionProblem | LinearEquationProblem],
         tokenizer: CharTokenizer,
         max_seq_len: int,
         reverse_digits: bool = True,
@@ -737,8 +1011,8 @@ class EquationDataset(Dataset):
         self.answer_only_loss = answer_only_loss
         self.use_scratchpad = use_scratchpad
         self.scratchpad_ops = scratchpad_ops
-        self.eq_id = tokenizer.token_to_id["="]
         self.examples: list[list[int]] = []
+        self.loss_starts: list[int] = []
 
         for p in problems:
             text = p.train_text(
@@ -757,7 +1031,16 @@ class EquationDataset(Dataset):
             )
             ids = tokenizer.encode(text, add_bos=True, add_eos=True)
             if len(ids) <= max_seq_len:
+                if answer_only_loss and think_start in text:
+                    prompt_part = text.split(think_start, 1)[0]
+                    prompt_ids = tokenizer.encode(prompt_part, add_bos=True, add_eos=False)
+                    loss_start = len(prompt_ids) - 1
+                elif answer_only_loss:
+                    loss_start = ids.index(tokenizer.token_to_id["="])
+                else:
+                    loss_start = 0
                 self.examples.append(ids)
+                self.loss_starts.append(loss_start)
 
     def __len__(self) -> int:
         return self.examples.__len__()
@@ -770,10 +1053,7 @@ class EquationDataset(Dataset):
         y = torch.tensor(ids[1:], dtype=torch.long)
 
         if self.answer_only_loss:
-            try:
-                eq_pos = ids.index(self.eq_id)
-            except ValueError:
-                eq_pos = 0
+            eq_pos = self.loss_starts[idx]
             for j in range(len(y)):
                 pred_index = j + 1
                 if pred_index <= eq_pos:
