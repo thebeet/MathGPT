@@ -33,11 +33,10 @@ class Config:
     max_seq_len: int = 768
     max_new_tokens: int = 640
 
-    # Train operands are length-balanced in 1..digits(max_*). Leave 7+ digits for OOD eval.
-    max_number: int = 999_999
-    # Inclusive max factor. 5-digit * 5-digit traces still fit in max_seq_len=256;
-    # 6-digit * 6-digit does not (needs ~300 tokens).
-    mul_max_operand: int = 999_999
+    # Train on larger operands so the model practices the same regime as OOD eval.
+    max_number: int = 9_999_999
+    # Large-factor multiplication is still short enough for max_seq_len=768.
+    mul_max_operand: int = 9_999_999
     include_addition: bool = True
     include_subtraction: bool = True
     include_multiplication: bool = True
@@ -54,34 +53,41 @@ class Config:
     scratchpad_ops: tuple[str, ...] = ("+", "-", "*")
     # Fraction of each training epoch made from multi-operation expressions.
     expression_fraction: float = 0.8
-    expression_max_terms: int = 8
-    expression_min_terms: int = 5
-    expression_start_max_terms: int = 5
+    expression_max_terms: int = 10
+    expression_min_terms: int = 6
+    expression_start_max_terms: int = 6
     expression_growth_every: int = 1
     expression_parentheses_fraction: float = 0.8
+    expression_train_min_digits: int = 5
+    expression_train_max_digits: int = 7
     division_fraction: float = 0.15
     # Continued training: mix familiar examples with longer 6-7 digit problems.
-    train_easy_max_number: int = 999_999
-    train_hard_min_digits: int = 6
-    train_hard_max_digits: int = 7
-    train_hard_fraction: float = 0.7
+    train_easy_max_number: int = 9_999_999
+    train_hard_min_digits: int = 7
+    train_hard_max_digits: int = 8
+    train_hard_fraction: float = 0.8
     # Probability applied independently to each binary operand.
     negative_fraction: float = 0.25
     # Only backprop on tokens after the prompt '=', including think + answer
     answer_only_loss: bool = True
     train_size: int = 1_000_000
-    val_size: int = 500
-    hard_eval_size: int = 100
-    expression_eval_size: int = 100
-    mul_eval_size: int = 100
-    # True length-OOD: longer than anything in training
-    ood_max_number: int = 9_999_999
-    ood_min_digits: int = 6
-    ood_max_digits: int = 7
-    ood_mul_size: int = 100
-    ood_mul_max_operand: int = 999_999
-    ood_mul_min_digits: int = 6
-    ood_mul_b_max_digits: int = 3
+    # Evaluation deliberately emphasizes difficult, large-number cases.
+    val_size: int = 1_000
+    hard_eval_size: int = 300
+    expression_eval_size: int = 300
+    expression_eval_min_terms: int = 7
+    expression_eval_max_terms: int = 12
+    expression_eval_min_digits: int = 7
+    expression_eval_max_digits: int = 9
+    mul_eval_size: int = 300
+    # True length-OOD: 8-9 digit operands are beyond the 6-7 digit training mix.
+    ood_max_number: int = 999_999_999
+    ood_min_digits: int = 8
+    ood_max_digits: int = 9
+    ood_mul_size: int = 300
+    ood_mul_max_operand: int = 99_999_999
+    ood_mul_min_digits: int = 7
+    ood_mul_b_max_digits: int = 4
     seed: int = 42
 
     # Training. Each epoch samples a fresh unique set; no example is reused.
@@ -91,7 +97,8 @@ class Config:
     grad_accum_steps: int = 16
     lr: float = 6e-5
     weight_decay: float = 0.1
-    epochs: int = 10
+    # Fine-tune the existing checkpoint on the updated fraction scratchpad.
+    epochs: int = 2
     warmup_steps: int = 1000
     grad_clip: float = 1.0
     log_every: int = 100

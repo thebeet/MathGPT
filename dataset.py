@@ -30,6 +30,79 @@ def format_fraction(value: Fraction) -> str:
     return f"{value.numerator}/{value.denominator}"
 
 
+def format_raw_fraction(numerator: int, denominator: int) -> str:
+    """Format a fraction without reducing it for use in reasoning traces."""
+    if denominator == 0:
+        raise ZeroDivisionError("division by zero")
+    if numerator == 0:
+        return "0"
+    if denominator < 0:
+        numerator, denominator = -numerator, -denominator
+    if denominator == 1:
+        return str(numerator)
+    return f"{numerator}/{denominator}"
+
+
+def evaluate_postfix_raw(
+    postfix: list[str],
+) -> tuple[Fraction, list[str]]:
+    """Evaluate postfix while retaining unreduced intermediate fractions.
+
+    The exact Fraction result is kept separately for correctness/final answers;
+    trace values use the arithmetic numerator and denominator directly.
+    """
+    stack: list[tuple[int, int]] = []
+    steps: list[str] = []
+    for tok in postfix:
+        if tok.isdigit():
+            stack.append((int(tok), 1))
+            continue
+        if len(stack) < 2:
+            raise ValueError("Invalid postfix expression")
+        right_n, right_d = stack.pop()
+        left_n, left_d = stack.pop()
+        if tok == "/" and right_n == 0:
+            raise ZeroDivisionError("division by zero")
+        if tok == "+":
+            result_n, result_d = left_n * right_d + right_n * left_d, left_d * right_d
+        elif tok == "-":
+            result_n, result_d = left_n * right_d - right_n * left_d, left_d * right_d
+        elif tok == "*":
+            result_n, result_d = left_n * right_n, left_d * right_d
+        elif tok == "/":
+            result_n, result_d = left_n * right_d, left_d * right_n
+        else:
+            raise ValueError(f"Unknown operator: {tok!r}")
+        # Zero is the one numerator-based simplification we allow. Keep all
+        # other common factors intact (for example, retain 8/8 as 8/8).
+        if result_n == 0:
+            result_n, result_d = 0, 1
+        elif result_d < 0:
+            result_n, result_d = -result_n, -result_d
+        left = format_raw_fraction(left_n, left_d)
+        right = format_raw_fraction(right_n, right_d)
+        result = format_raw_fraction(result_n, result_d)
+        # Do not spend a reasoning step restating an already unchanged value,
+        # e.g. 12/5=12/5 when a division merely produces that fraction.
+        if f"{left}{tok}{right}" != result:
+            if tok in {"+", "-"} and (left_d != 1 or right_d != 1):
+                sign = "+" if tok == "+" else "-"
+                expanded = (
+                    f"({left_n}*{right_d}{sign}{right_n}*{left_d})/"
+                    f"({left_d}*{right_d})"
+                )
+                numerator = f"({left_n * right_d}{sign}{right_n * left_d})"
+                numeric = f"{numerator}/{left_d * right_d}"
+                steps.append(f"{left}{tok}{right}={expanded}={numeric}={result}")
+            else:
+                steps.append(f"{left}{tok}{right}={result}")
+        stack.append((result_n, result_d))
+    if len(stack) != 1:
+        raise ValueError("Invalid postfix expression")
+    numerator, denominator = stack[0]
+    return Fraction(numerator, denominator), steps
+
+
 def parse_prompt(prompt: str) -> tuple[int, str, int]:
     """Parse human prompt '123+45=' / '12*3=' into (a, op, b)."""
     body = prompt.strip().replace(" ", "").rstrip("=")
@@ -149,13 +222,10 @@ def expression_train_text(
     think_end: str = "</think>",
 ) -> str:
     postfix = expression_postfix(expr)
-    result, steps = evaluate_postfix(postfix)
+    result, steps = evaluate_postfix_raw(postfix)
     return (
         f"{expr}={think_start}"
-        + ";".join(
-            f"{left}{op}{right}={value}"
-            for left, op, right, value in steps
-        )
+        + ";".join(steps)
         + f"{think_end}{result}"
     )
 
@@ -428,6 +498,8 @@ def generate_expression_problems(
     min_terms: int = 2,
     max_terms: int = 4,
     parentheses_fraction: float = 0.5,
+    min_digits: int | None = None,
+    max_digits: int | None = None,
 ) -> list[ExpressionProblem]:
     """Generate valid mixed expressions for supervised postfix learning."""
     rng = random.Random(seed)
@@ -438,7 +510,10 @@ def generate_expression_problems(
     max_terms = max(min_terms, max_terms)
     while len(out) < n:
         terms = rng.randint(min_terms, max_terms)
-        values = [sample_number(rng, max_number) for _ in range(terms)]
+        values = [
+            sample_number(rng, max_number, min_digits=min_digits, max_digits=max_digits)
+            for _ in range(terms)
+        ]
         operators = [rng.choice(ops) for _ in range(terms - 1)]
         parts = [str(values[0])]
         for op, value in zip(operators, values[1:]):

@@ -338,10 +338,12 @@ def main() -> None:
     used_keys: set[tuple[int, str, int]] = set()
     val_probs = generate_problems(
         cfg.val_size,
-        cfg.max_number,
+        cfg.ood_max_number,
         seed=cfg.seed + 1,
+        min_digits=cfg.ood_min_digits,
+        max_digits=cfg.ood_max_digits,
         exclude=used_keys,
-        **gen_kwargs,
+        **{**gen_kwargs, "mul_max_operand": cfg.ood_mul_max_operand},
     )
     hard_probs = generate_problems(
         cfg.hard_eval_size,
@@ -358,10 +360,12 @@ def main() -> None:
     )
     mul_probs = generate_problems(
         cfg.mul_eval_size,
-        cfg.max_number,
+        cfg.ood_mul_max_operand,
         seed=cfg.seed + 9,
+        min_digits=cfg.ood_mul_min_digits,
+        max_digits=cfg.ood_mul_min_digits,
         ops_filter=["*"],
-        **gen_kwargs,
+        **{**gen_kwargs, "mul_max_operand": cfg.ood_mul_max_operand},
     )
     ood_mul_probs = generate_problems(
         cfg.ood_mul_size,
@@ -382,8 +386,11 @@ def main() -> None:
         cfg.expression_eval_size,
         cfg.ood_max_number,
         seed=cfg.seed + 13,
-        max_terms=cfg.expression_max_terms,
+        min_terms=cfg.expression_eval_min_terms,
+        max_terms=cfg.expression_eval_max_terms,
         parentheses_fraction=cfg.expression_parentheses_fraction,
+        min_digits=cfg.expression_eval_min_digits,
+        max_digits=cfg.expression_eval_max_digits,
     )
     for p in hard_probs + mul_probs + ood_mul_probs:
         used_keys.add((p.a, p.op, p.b))
@@ -610,6 +617,8 @@ def main() -> None:
                     min_terms=cfg.expression_min_terms,
                     max_terms=expression_max_terms,
                     parentheses_fraction=cfg.expression_parentheses_fraction,
+                    min_digits=cfg.expression_train_min_digits,
+                    max_digits=cfg.expression_train_max_digits,
                 )
             )
         train_ds = EquationDataset(train_probs, **ds_kwargs)
